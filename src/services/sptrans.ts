@@ -47,6 +47,21 @@ function descreverSentido(l: any): string {
 }
 
 /**
+ * Ordena previsões pelo horário (HH:MM) e mantém só a próxima chegada de cada parada
+ * @param previsoes - Lista de previsões { p, np, t, s }
+ */
+function ordenarPorHorario(previsoes: any[]): any[] {
+  const ordenadas = [...previsoes].sort((a, b) => String(a.t).localeCompare(String(b.t)));
+  const vistas = new Set<string>();
+  return ordenadas.filter((pr) => {
+    const id = String(pr.p);
+    if (vistas.has(id)) return false;
+    vistas.add(id);
+    return true;
+  });
+}
+
+/**
  * Serviço para integração com a API Olho Vivo da SPTrans
  * Fornece funções para autenticação e busca de linhas, paradas, previsões e veículos
  */
@@ -163,27 +178,64 @@ export const SPTransAPIReal = {
   },
 
   /**
-   * Busca previsões de chegada da linha em todas as paradas
-   * @param codigoLinha - Código identificador da linha
-   * @returns Lista achatada de previsões { p: código da parada, t: horário, s: sentido }
+   * Busca previsões de chegada da linha
+   * 1º tenta /Previsao/Linha (todas as paradas de uma vez).
+   * Esse endpoint costuma vir com `ps` vazio para muitas linhas; nesse caso usa o
+   * plano B: lista as paradas da linha e consulta /Previsao?codigoParada&codigoLinha
+   * para algumas delas.
+   * @param codigoLinha - Código identificador da linha (cl)
+   * @returns Lista de previsões { p: código da parada, np: nome da parada, t: horário, s: sentido }
    */
   async buscarPrevisoes(codigoLinha: number): Promise<any[]> {
-    // Consulta o endpoint de previsões por linha
+    // --- Plano A: previsões da linha inteira ---
     const resposta = await this.requisicao(`/Previsao/Linha?codigoLinha=${codigoLinha}`);
-    // A resposta tem o formato { hr, ps: [ { cp, np, vs: [ { p, t, ... } ] } ] }
-    if (!resposta || !Array.isArray(resposta.ps)) return [];
-    // Lista final de previsões
+    if (__DEV__) {
+      console.log('[previsoes] /Previsao/Linha', codigoLinha, '→', JSON.stringify(resposta)?.slice(0, 300));
+    }
+    // Formato esperado: { hr, ps: [ { cp, np, vs: [ { p, t, ... } ] } ] }
+    const paradas = Array.isArray(resposta?.ps) ? resposta.ps : [];
     const previsoes: any[] = [];
-    // Percorre cada parada
-    for (const parada of resposta.ps) {
-      // Percorre cada veículo previsto para a parada
-      for (const v of parada.vs || []) {
-        // Adiciona a previsão no formato usado pela tela
-        previsoes.push({ p: parada.cp, t: v.t, s: 0 });
+    for (const parada of paradas) {
+      for (const v of parada?.vs || []) {
+        if (v?.t) previsoes.push({ p: parada.cp, np: parada.np || '', t: v.t, s: 0 });
       }
     }
-    // Ordena pelo horário previsto
-    return previsoes.sort((a, b) => String(a.t).localeCompare(String(b.t)));
+    if (previsoes.length > 0) return ordenarPorHorario(previsoes);
+
+    // --- Plano B: consulta parada por parada ---
+    try {
+      const paradasLinha = await this.requisicao(`/Parada/BuscarParadasPorLinha?codigoLinha=${codigoLinha}`);
+      if (!Array.isArray(paradasLinha) || paradasLinha.length === 0) return [];
+
+      // Limita a quantidade de chamadas: pega paradas espalhadas ao longo do trajeto
+      const MAX_PARADAS = 8;
+      const passo = Math.max(1, Math.floor(paradasLinha.length / MAX_PARADAS));
+      const escolhidas = paradasLinha.filter((_: any, i: number) => i % passo === 0).slice(0, MAX_PARADAS);
+
+      const respostas = await Promise.allSettled(
+        escolhidas.map((pa: any) =>
+          this.requisicao(`/Previsao?codigoParada=${pa.cp}&codigoLinha=${codigoLinha}`)
+        )
+      );
+
+      respostas.forEach((r, i) => {
+        if (r.status !== 'fulfilled') return;
+        // Formato: { hr, p: { cp, np, l: [ { cl, vs: [ { p, t } ] } ] } }
+        const pa = r.value?.p;
+        const parada = escolhidas[i];
+        for (const l of pa?.l || []) {
+          for (const v of l?.vs || []) {
+            if (v?.t) previsoes.push({ p: pa?.cp ?? parada.cp, np: pa?.np || parada.np || '', t: v.t, s: 0 });
+          }
+        }
+      });
+
+      if (__DEV__) console.log('[previsoes] plano B:', previsoes.length, 'previsões em', escolhidas.length, 'paradas');
+      return ordenarPorHorario(previsoes);
+    } catch (error) {
+      if (__DEV__) console.warn('[previsoes] plano B falhou:', error);
+      return [];
+    }
   },
 
   /**

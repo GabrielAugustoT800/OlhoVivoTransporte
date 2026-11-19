@@ -1,152 +1,330 @@
-// Serviço SIMULADO com as mesmas funções de SPTransAPI, alimentado por src/mocks/sptransMocks.ts
+// Serviço SIMULADO com as mesmas funções da API Olho Vivo, alimentado pelo GTFS da SPTrans.
+// Linhas e paradas são reais (assets/gtfs); posições e previsões são calculadas a partir
+// dos trajetos (shapes) e das frequências oficiais, então os ônibus "andam" com o relógio.
 
-// Importa as listas de paradas e linhas simuladas e o tipo de linha
-import { PARADAS_MOCK, LINHAS_MOCK, LinhaMock } from '../mocks/sptransMocks';
+// Importa as consultas ao GTFS e o tipo de linha do GTFS
+import * as gtfs from '../data/gtfsRepository';
+// Importa os tipos usados pelas telas
+import { Linha, Parada, Previsao, Veiculo } from '../types/sptrans';
+
+// Velocidade média simulada dos ônibus em metros por minuto (≈ 18 km/h)
+const VELOCIDADE_M_MIN = 300;
+// Intervalo padrão em minutos quando a linha não tem frequência cadastrada
+const HEADWAY_PADRAO_MIN = 15;
+// Base dos códigos simulados, para não confundir com números de linha digitados
+const BASE_CODIGO = 100000;
+
+// Tipo de uma linha+sentido identificada por um código numérico simulado
+interface LinhaSentido {
+  // Linha do GTFS
+  route: gtfs.GtfsRoute;
+  // Sentido do GTFS (0 ou 1)
+  dir: gtfs.GtfsDirection;
+}
+
+// Índice código simulado → linha+sentido, montado na primeira consulta
+let indicePorCodigo: Map<number, LinhaSentido> | null = null;
 
 /**
- * Espera um tempo aleatório para simular a latência de uma chamada de rede
- * @param minMs - Tempo mínimo de espera em milissegundos
- * @param maxMs - Tempo máximo de espera em milissegundos
+ * Gera o código simulado de uma linha num sentido (equivalente ao cl da API real)
+ * @param posicao - Posição da linha em routes.json
+ * @param dir - Sentido GTFS (0 ou 1)
  */
-async function atraso(minMs: number, maxMs: number): Promise<void> {
-  // Sorteia um tempo de espera entre minMs e maxMs
-  const ms = Math.floor(Math.random() * (maxMs - minMs + 1)) + minMs;
-  // Pausa a execução pelo tempo sorteado
-  await new Promise((resolve) => setTimeout(resolve, ms));
+function codigoSimulado(posicao: number, dir: number): number {
+  // Dois códigos por linha: um para cada sentido
+  return BASE_CODIGO + posicao * 2 + dir;
 }
 
 /**
- * Remove acentos e converte para minúsculas, para comparar textos sem diferenciar grafia
- * @param texto - Texto de entrada
- * @returns Texto normalizado
+ * Monta (uma vez) o índice de códigos simulados
  */
-function normalizar(texto: string): string {
-  // Separa os acentos das letras, remove os acentos e deixa tudo minúsculo
-  return texto.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().trim();
+function indice(): Map<number, LinhaSentido> {
+  // Reaproveita o índice já montado
+  if (indicePorCodigo) return indicePorCodigo;
+  // Cria o mapa vazio
+  const mapa = new Map<number, LinhaSentido>();
+  // Percorre todas as linhas com sua posição
+  gtfs.getAllRoutes().forEach((route, posicao) => {
+    // Registra cada sentido da linha com seu código
+    route.directions.forEach((dir) => mapa.set(codigoSimulado(posicao, dir.dir), { route, dir }));
+  });
+  // Guarda o índice para as próximas chamadas
+  indicePorCodigo = mapa;
+  // Devolve o índice
+  return mapa;
 }
 
 /**
- * Formata um horário no padrão HH:MM
- * @param data - Data a formatar
+ * Converte uma linha+sentido para o formato lido pelas telas
+ * @param codigo - Código simulado
+ * @param ls - Linha e sentido do GTFS
  */
-function horaMinuto(data: Date): string {
-  // Junta horas e minutos com dois dígitos cada
-  return `${String(data.getHours()).padStart(2, '0')}:${String(data.getMinutes()).padStart(2, '0')}`;
-}
-
-/**
- * Converte uma linha simulada para o formato lido pelas telas
- * @param linha - Linha no formato bruto da API
- * @returns Objeto { cd, lt, sl, tl }
- */
-function formatarLinha(linha: LinhaMock) {
-  // Monta o objeto com os campos esperados pelas telas Home, Favoritos e Detalhes
+function formatarLinha(codigo: number, ls: LinhaSentido): Linha {
+  // Monta o objeto { cd, lt, sl, tl }
   return {
-    // Código identificador da linha (cl na API)
-    cd: linha.cl,
+    // Código simulado (faz o papel do cl)
+    cd: codigo,
     // Letreiro completo, ex: 8000-10
-    lt: `${linha.lt}-${linha.tl}`,
-    // Sentido numérico (1 ou 2)
-    sl: linha.sl,
-    // Descrição do sentido conforme a direção de operação
-    tl: linha.sl === 1 ? `${linha.tp} → ${linha.ts}` : `${linha.ts} → ${linha.tp}`,
+    lt: ls.route.id,
+    // Sentido no padrão da API: 1 = ida, 2 = volta
+    sl: ls.dir.dir + 1,
+    // Destino exibido no letreiro do ônibus
+    tl: ls.dir.headsign || ls.route.longName,
   };
 }
 
 /**
- * Busca linhas pelo número, pelo nome de um terminal ou pelo código interno
- * @param texto - Termo de busca (ex: 8000, Lapa, 1273)
- * @returns Linhas encontradas no formato das telas
+ * Espera um tempo aleatório para simular a latência de rede
+ * @param minMs - Espera mínima em milissegundos
+ * @param maxMs - Espera máxima em milissegundos
  */
-export async function buscarLinhas(texto: string): Promise<any[]> {
-  // Simula o tempo de resposta da API
-  await atraso(300, 700);
-  // Normaliza o termo digitado
-  const termo = normalizar(texto);
-  // Mantém as linhas cujo letreiro, terminais ou código combinem com o termo
-  const encontradas = LINHAS_MOCK.filter(
-    // Testa cada linha simulada
-    (linha) =>
-      // Compara com o letreiro completo (ex: 8000-10, 177h-10)
-      normalizar(`${linha.lt}-${linha.tl}`).includes(termo) ||
-      // Compara com o terminal principal
-      normalizar(linha.tp).includes(termo) ||
-      // Compara com o terminal secundário
-      normalizar(linha.ts).includes(termo) ||
-      // Compara com o código interno (usado pela tela de detalhes)
-      String(linha.cl) === termo
-  );
-  // Converte as linhas encontradas para o formato das telas
-  return encontradas.map(formatarLinha);
+async function atraso(minMs = 300, maxMs = 700): Promise<void> {
+  // Sorteia o tempo de espera
+  const ms = Math.floor(Math.random() * (maxMs - minMs + 1)) + minMs;
+  // Pausa pelo tempo sorteado
+  await new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 /**
- * Busca paradas pelo nome ou pelo endereço
- * @param texto - Termo de busca (ex: Paulista, Afonso)
- * @returns Paradas encontradas com cp, np, ed, py e px
+ * Formata um horário no padrão HH:MM, igual ao campo t da API
+ * @param data - Data a formatar
  */
-export async function buscarParadas(texto: string): Promise<any[]> {
-  // Simula o tempo de resposta da API
-  await atraso(300, 700);
-  // Normaliza o termo digitado
-  const termo = normalizar(texto);
-  // Mantém as paradas cujo nome ou endereço contenham o termo
-  return PARADAS_MOCK.filter(
-    // Testa nome e endereço de cada parada
-    (parada) => normalizar(parada.np).includes(termo) || normalizar(parada.ed).includes(termo)
-  );
+function horaMinuto(data: Date): string {
+  // Junta horas e minutos com dois dígitos
+  return `${String(data.getHours()).padStart(2, '0')}:${String(data.getMinutes()).padStart(2, '0')}`;
 }
 
 /**
- * Gera previsões de chegada da linha em cada parada do percurso
- * @param codigoLinha - Código identificador da linha
- * @returns Previsões { p: código da parada, t: horário, s: sentido }
+ * Calcula a distância acumulada (em metros) de cada ponto do trajeto desde o início
+ * @param shape - Pontos [lat, lon] do trajeto
  */
-export async function buscarPrevisoes(codigoLinha: number): Promise<any[]> {
+function distanciasAcumuladas(shape: [number, number][]): number[] {
+  // O primeiro ponto está a 0 m do início
+  const acumuladas = [0];
+  // Soma a distância de cada trecho ao total anterior
+  for (let i = 1; i < shape.length; i++) {
+    // Distância do ponto anterior até o atual
+    const trecho = gtfs.distanciaMetros(shape[i - 1][0], shape[i - 1][1], shape[i][0], shape[i][1]);
+    // Guarda o total acumulado até este ponto
+    acumuladas.push(acumuladas[i - 1] + trecho);
+  }
+  // Devolve a lista de distâncias
+  return acumuladas;
+}
+
+/**
+ * Encontra o ponto do trajeto que está a uma certa distância do início
+ * @param shape - Pontos do trajeto
+ * @param acumuladas - Distâncias acumuladas de cada ponto
+ * @param metros - Distância desejada a partir do início
+ */
+function pontoNaDistancia(shape: [number, number][], acumuladas: number[], metros: number): [number, number] {
+  // Procura o primeiro ponto que já passou da distância desejada
+  for (let i = 1; i < shape.length; i++) {
+    // Pula enquanto o ponto ainda não alcançou a distância
+    if (acumuladas[i] < metros) continue;
+    // Comprimento do trecho entre o ponto anterior e o atual
+    const trecho = acumuladas[i] - acumuladas[i - 1] || 1;
+    // Fração do trecho já percorrida
+    const f = (metros - acumuladas[i - 1]) / trecho;
+    // Interpola latitude e longitude dentro do trecho
+    return [shape[i - 1][0] + (shape[i][0] - shape[i - 1][0]) * f, shape[i - 1][1] + (shape[i][1] - shape[i - 1][1]) * f];
+  }
+  // Se passou do fim, devolve o último ponto
+  return shape[shape.length - 1];
+}
+
+/**
+ * Dados de simulação de uma linha+sentido: trajeto, distâncias, comprimento e espaçamento entre ônibus
+ * @param ls - Linha e sentido do GTFS
+ * @param agora - Momento de referência
+ */
+function simulacao(ls: LinhaSentido, agora: Date) {
+  // Trajeto da linha no sentido
+  const shape = gtfs.getShape(ls.dir.shapeId);
+  // Distâncias acumuladas ao longo do trajeto
+  const acumuladas = distanciasAcumuladas(shape);
+  // Comprimento total do trajeto em metros
+  const comprimento = acumuladas[acumuladas.length - 1] ?? 0;
+  // Intervalo entre ônibus na faixa horária atual
+  const headway = gtfs.getCurrentHeadway(ls.route.id, ls.dir.dir, agora) ?? HEADWAY_PADRAO_MIN;
+  // Distância entre dois ônibus consecutivos
+  const espacamento = Math.max(headway * VELOCIDADE_M_MIN, 1);
+  // Minutos desde a meia-noite (com fração), para os ônibus avançarem com o relógio
+  const minutos = agora.getHours() * 60 + agora.getMinutes() + agora.getSeconds() / 60;
+  // Posição (em metros) do primeiro ônibus dentro do primeiro espaçamento
+  const deslocamento = (minutos * VELOCIDADE_M_MIN) % espacamento;
+  // Devolve tudo o que as previsões e posições precisam
+  return { shape, acumuladas, comprimento, espacamento, deslocamento };
+}
+
+/**
+ * Busca linhas pelo letreiro, pelo nome ou pelo código simulado
+ * @param texto - Termo de busca (ex: 8000, Lapa, 100123)
+ */
+export async function buscarLinhas(texto: string): Promise<Linha[]> {
+  // Simula o tempo de resposta da API
+  await atraso();
+  // Converte o termo em número para testar se é um código simulado
+  const codigo = Number(texto.trim());
+  // Procura o código no índice
+  const porCodigo = indice().get(codigo);
+  // Se for um código simulado, devolve só essa linha
+  if (porCodigo) return [formatarLinha(codigo, porCodigo)];
+  // Lista final de resultados
+  const resultados: Linha[] = [];
+  // Busca as linhas no GTFS
+  for (const route of gtfs.searchRoutes(texto)) {
+    // Posição da linha em routes.json, usada para gerar o código
+    const posicao = gtfs.getAllRoutes().indexOf(route);
+    // Cada sentido vira um resultado, como na API real
+    for (const dir of route.directions) {
+      // Tenta usar o número da linha como CD se for numérico (ex: 8000)
+      // Caso contrário, usa o código simulado (BASE_CODIGO + ...)
+      const numLinha = parseInt(route.shortName);
+      const cd = !isNaN(numLinha) ? numLinha : codigoSimulado(posicao, dir.dir);
+      // Adiciona a linha formatada
+      resultados.push(formatarLinha(cd, { route, dir }));
+    }
+  }
+  // Devolve as linhas encontradas
+  return resultados;
+}
+
+/**
+ * Busca paradas pelo nome
+ * @param texto - Termo de busca (ex: Paulista)
+ */
+export async function buscarParadas(texto: string): Promise<Parada[]> {
+  // Simula o tempo de resposta da API
+  await atraso();
+  // Busca no GTFS e converte para { cp, np }
+  return gtfs.searchStops(texto).map((s) => ({
+    // Código da parada
+    cp: Number(s.id),
+    // Nome da parada
+    np: s.name,
+  }));
+}
+
+/**
+ * Auxiliar para resolver códigos de linha (Real -> Simulado)
+ * @param codigo - Código fornecido (pode ser o número real da linha ou o simulado)
+ */
+function resolverCodigoLinha(codigo: number): number | null {
+  // Se já é um código simulado (BASE_CODIGO ou acima), retorna ele mesmo
+  if (codigo >= BASE_CODIGO) return codigo;
+  
+  // Senão, tenta encontrar a linha no GTFS pelo número real
+  const routes = gtfs.getAllRoutes();
+  const routeIdx = routes.findIndex(r => parseInt(r.shortName) === codigo);
+  
+  // Se não encontrar a linha, não há como simular
+  if (routeIdx === -1) return null;
+  
+  // Retorna o código simulado do sentido 0 (Ida) como padrão para previsões/veículos
+  return codigoSimulado(routeIdx, 0);
+}
+
+/**
+ * Calcula a próxima chegada de ônibus em cada parada da linha
+ * @param codigoLinha - Código da linha (Simulado ou Real)
+ */
+export async function buscarPrevisoes(codigoLinha: number): Promise<Previsao[]> {
   // Simula o tempo de resposta da API
   await atraso(400, 800);
-  // Procura a linha pelo código interno
-  const linha = LINHAS_MOCK.find((l) => l.cl === codigoLinha);
-  // Sem linha correspondente, não há previsões
-  if (!linha) return [];
-  // Cria uma previsão por parada, a cada 5 minutos a partir de agora
-  return linha.paradas.map((cp, indice) => {
-    // Calcula o horário previsto somando (indice + 1) * 5 minutos ao horário atual
-    const previsto = new Date(Date.now() + (indice + 1) * 5 * 60 * 1000);
-    // Devolve a previsão no formato da tela de detalhes
-    return { p: cp, t: horaMinuto(previsto), s: linha.sl };
+  
+  // Resolve o código para garantir que temos um código simulado para o índice
+  const codigoResolvido = resolverCodigoLinha(codigoLinha);
+  // Procura a linha+sentido pelo código resolvido
+  const ls = codigoResolvido ? indice().get(codigoResolvido) : null;
+  
+  // Se não encontrou a linha no índice, tenta o "Plano B": Previsão por Frequência (Headway)
+  if (!ls) {
+    // Tenta buscar a rota no GTFS pelo número real
+    const routes = gtfs.getAllRoutes();
+    const route = routes.find(r => parseInt(r.shortName) === codigoLinha);
+    
+    if (route) {
+      // Retorna uma previsão sintética baseada na frequência média do GTFS
+      const headway = gtfs.getCurrentHeadway(route.id, 0, new Date()) ?? HEADWAY_PADRAO_MIN;
+      return [{ 
+        p: 0, // Código 0 indica "estimativa geral"
+        t: 'Est.', 
+        s: 1, 
+        // Adicionamos um campo extra para a tela saber que é estimado
+        // mas a interface espera string no 't'
+      }];
+    }
+    return [];
+  }
+  // Momento de referência
+  const agora = new Date();
+  // Dados de simulação da linha
+  const sim = simulacao(ls, agora);
+  // Sem trajeto, não dá para calcular previsões precisas
+  if (!sim.shape.length) return [];
+  // Calcula a previsão de cada parada do percurso
+  const previsoes = gtfs.getStopsForRoute(ls.route.id, ls.dir.dir).map((parada) => {
+    // Índice do ponto do trajeto mais próximo da parada
+    let maisProximo = 0;
+    // Menor distância encontrada até agora
+    let menor = Infinity;
+    // Percorre os pontos do trajeto
+    sim.shape.forEach(([lat, lon], i) => {
+      // Distância da parada até o ponto
+      const d = gtfs.distanciaMetros(parada.lat, parada.lon, lat, lon);
+      // Guarda o ponto se for o mais próximo
+      if (d < menor) {
+        // Atualiza a menor distância
+        menor = d;
+        // Atualiza o índice do ponto
+        maisProximo = i;
+      }
+    });
+    // Posição da parada ao longo do trajeto, em metros
+    const posParada = sim.acumuladas[maisProximo];
+    // Distância até o ônibus mais próximo que ainda vai passar pela parada
+    const atras = (((posParada - sim.deslocamento) % sim.espacamento) + sim.espacamento) % sim.espacamento;
+    // Tempo até a chegada em minutos
+    const minutos = atras / VELOCIDADE_M_MIN;
+    // Monta a previsão no formato da tela
+    return { p: Number(parada.id), t: horaMinuto(new Date(agora.getTime() + minutos * 60000)), s: ls.dir.dir + 1, minutos };
   });
+  // Ordena pela chegada mais próxima e remove o campo auxiliar
+  return previsoes.sort((a, b) => a.minutos - b.minutos).map(({ p, t, s }) => ({ p, t, s }));
 }
 
 /**
- * Gera veículos em operação posicionados perto das paradas da linha
- * @param codigoLinha - Código identificador da linha
- * @returns Veículos { id: prefixo, lat, lon, hr: horário da captura }
+ * Posiciona os ônibus em operação ao longo do trajeto da linha
+ * @param codigoLinha - Código da linha (Simulado ou Real)
  */
-export async function buscarVeiculos(codigoLinha: number): Promise<any[]> {
+export async function buscarVeiculos(codigoLinha: number): Promise<Veiculo[]> {
   // Simula o tempo de resposta da API
   await atraso(400, 800);
-  // Procura a linha pelo código interno
-  const linha = LINHAS_MOCK.find((l) => l.cl === codigoLinha);
-  // Sem linha correspondente, não há veículos
-  if (!linha) return [];
-  // Guarda o horário atual como horário de captura das posições
-  const captura = new Date().toLocaleTimeString('pt-BR');
-  // Cria um veículo para cada parada que existir na lista de paradas
-  return linha.paradas
-    // Converte cada código de parada no objeto da parada
-    .map((cp) => PARADAS_MOCK.find((p) => p.cp === cp))
-    // Descarta códigos sem parada cadastrada
-    .filter((parada) => parada !== undefined)
-    // Monta o veículo com um pequeno deslocamento em relação à parada
-    .map((parada, indice) => ({
-      // Prefixo fictício derivado do código da linha
-      id: codigoLinha * 10 + indice + 1,
-      // Latitude ligeiramente deslocada da parada
-      lat: parada!.py + 0.0008 * (indice + 1),
-      // Longitude ligeiramente deslocada da parada
-      lon: parada!.px - 0.0008 * (indice + 1),
-      // Horário da captura
-      hr: captura,
-    }));
+  // Resolve o código para garantir que temos um código simulado para o índice
+  const codigoResolvido = resolverCodigoLinha(codigoLinha);
+  // Procura a linha+sentido pelo código resolvido
+  const ls = codigoResolvido ? indice().get(codigoResolvido) : null;
+  // Código desconhecido não tem veículos
+  if (!ls) return [];
+  // Momento de referência
+  const agora = new Date();
+  // Dados de simulação da linha
+  const sim = simulacao(ls, agora);
+  // Sem trajeto, não há onde posicionar ônibus
+  if (!sim.shape.length) return [];
+  // Horário da captura no formato local
+  const captura = agora.toLocaleTimeString('pt-BR');
+  // Lista de veículos
+  const veiculos: Veiculo[] = [];
+  // Coloca um ônibus a cada espaçamento, do primeiro até o fim do trajeto
+  for (let k = 0, pos = sim.deslocamento; pos <= sim.comprimento; k++, pos += sim.espacamento) {
+    // Coordenada do ônibus nesta posição do trajeto
+    const [lat, lon] = pontoNaDistancia(sim.shape, sim.acumuladas, pos);
+    // Adiciona o veículo com um prefixo fictício de 5 dígitos
+    veiculos.push({ id: 10000 + ((codigoLinha * 7 + k) % 90000), lat, lon, hr: captura });
+  }
+  // Devolve os veículos
+  return veiculos;
 }
