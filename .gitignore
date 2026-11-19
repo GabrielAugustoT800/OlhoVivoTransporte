@@ -1,5 +1,8 @@
 # Learn more https://docs.github.com/en/get-started/getting-started-with-git/ignoring-files
 
+# GTFS bruto baixado da SPTrans (~67 MB); a base derivada fica em assets/gtfs
+/gtfs/
+
 # dependencies
 node_modules/
 
